@@ -1,0 +1,101 @@
+#!/usr/bin/perl
+use 5.014 ; use strict ; use warnings ; 
+use Getopt::Std ; getopts '12c:ms' , \my %o ; 
+use List::Util qw[min max shuffle ] ; 
+use Scalar::Util qw[dualvar] ; 
+use List::MoreUtils qw[uniq ] ;
+use Term::ANSIColor qw[:constants] ; $Term::ANSIColor::AUTORESET=1; 
+use Time::HiRes qw [ gettimeofday tv_interval ] ;
+my ${ dt_start } = [ gettimeofday ] ; 
+
+
+END{
+  my $lt = sprintf '%04d-%02d-%02d %02d:%02d:%02d' , do {my @t = @{[localtime]}[5,4,3,2,1,0] ; $t[0]+=1900 ; $t[1]++ ; @t } ; 
+  say STDERR CYAN FAINT BOLD tv_interval( ${ dt_start } ) , " seconds spent ($0 $lt)"; 
+}
+
+
+READ_FILE_1 : 
+my $cmd = ! $o{2} ? "gawk -F, '{print \$1,\$3}' $ARGV[0]" : "gawk -F, '{print substr(\$1,1,2),\$3}' $ARGV[0]" ;
+open my $FH , '-|' , $cmd ; # $/ = "\r\n" ; 
+my %m2p ;  # メッシュ8桁から自治体コード5桁を参照する
+while ( <$FH> ) { 
+  chomp ; 
+  next unless /^\d/ ; 
+  my @F = split / / , $_ , 2 ; 
+  $m2p { $F[1] } = $F[0] ; # $o{2} ? substr $F[0], 0, 2 : $F[0] ;
+}
+close $FH ; 
+
+READ_FILE_2 :
+my $cond = $o{c} // '' ;
+open $FH, '-|', "unzip -p $ARGV[1] | gawk -F, '$cond {print substr(\$3,1,8),\$7}'" ; #$ARGV[1] ;
+my ( %maxp , %sump ) ; # 各地域での、最大値または合計値を格納する。
+my @meshNG ; # 参照されなかったメッシュを記録する。
+while ( <$FH> ){
+  chomp ;
+  next unless /^\d/ ;
+  my ($mesh,$pop) = split / /, $_ , 2 ; 
+  my $place ;
+  $place = $m2p{$mesh} // do { push @meshNG , $mesh ; next }; 
+  if ( $o{1} ) { say join "\t" , $place, $pop } 
+  if ( $o{m} ) { $maxp{$place} = dualvar $pop, $mesh if ! exists $maxp{$place} || $pop >= $maxp{$place} } 
+  if ( $o{s} ) { $sump{$place} += $pop } ;
+}
+
+do { say join "\t" , $_ , $maxp{$_}+0 , $maxp{$_}.'' for sort keys %maxp } if $o{m} ;
+do { say join "\t" , $_ , $sump{$_} for sort keys %sump } if $o{s} ;
+
+#@meshNG = shuffle @meshNG ;
+say STDERR GREEN scalar @meshNG , " meshes being not referred ; " , (min @meshNG) , " - " , (max @meshNG) , "; " , join " " , splice @{[shuffle uniq @meshNG]}, 0, 5   if @meshNG ; 
+
+
+=encoding utf8 
+
+=head1
+
+  $0 -[1m] FILE1 FILE2 
+   
+    提供データのメッシュコードを自治体コードに変換して、換算滞在人数を出力する。
+
+    FILE1 : 「自治体コード, 自治体名, メッシュコード8桁, 備考」の形式のcsvファイル。例 five4eight.csv
+    FILE2 : 提供されている7列のデータで圧縮されたもの(unzipは不要)。
+
+ オプション : 
+
+   -1 ; 単純に、メッシュコードを自治体コードに変換した人口を見る。
+   -2 ; 都道府県だけを見る。(自治体コード5桁全体ではなく先頭2桁だけを参照。)
+   -c '$5==30' ; 2番目のファイルで、年齢($5)に制限を課すなどのawkの制限句を付ける。(内部でawkを起動している。)
+   -m ; 各都道府県または各自治体ごとの、最大メッシュを探す
+   -s ; 各都道府県または各自治体ごとの、合計値を出力する。
+
+  利用上の注意点 : 
+    - 自治体コードとメッシュコードを記載した参照ファイルは、同じメッシュコードに対しては、最後に読んだ自治体コードが優先される。
+    - 最大値の -m の場合も、最後に読んだ方が優先させる蓮
+
+
+  開発メモ : 
+   * 2番目のファイルは、複数与えたり、年齢に制限 つまり $5==30のような制約を付与可能としたい。
+
+=cut 
+
+## ヘルプとバージョン情報
+BEGIN {
+  $Getopt::Std::STANDARD_HELP_VERSION = 1 ; 
+  grep { m/--help/} @ARGV and *VERSION_MESSAGE = sub {} ; 
+  our $VERSION = 0.11 ;
+    # 最初は 0.21 を目安とする。
+    # 1.00 以上とする必要条件は英語版のヘルプをきちんと出すこと。
+    # 2.00 以上とする必要条件はテストコードが含むこと。
+}  
+sub HELP_MESSAGE{
+    use FindBin qw[ $Script ] ; 
+    $ARGV[1] //= '' ;
+    open my $FH , '<' , $0 ;
+    while(<$FH>){
+        s/\$0/$Script/g ;
+        print $_ if $ARGV[1] eq 'opt' ? m/^\ +\-/ : s/^=head1// .. s/^=cut// ;
+    }
+    close $FH ;
+    exit 0 ;
+}
