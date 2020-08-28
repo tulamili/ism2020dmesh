@@ -4,117 +4,136 @@ use List::Util ;
 use List::MoreUtils qw[uniq] ;
 use Term::ANSIColor qw[:constants] ; $Term::ANSIColor::AUTORESET=1 ;
 use IO::Uncompress::Unzip qw[ unzip $UnzipError ] ; 
-use Getopt::Std ; getopts '%256r:o' , \my%o ;
-use Time::HiRes qw [ gettimeofday tv_interval ] ;
+use Getopt::Std ; getopts '%256gpr:' , \my%o ;
+use Time::HiRes qw [ gettimeofday tv_interval sleep ] ;
 my ${ dt_start } = [ gettimeofday ] ; 
 
-END{
+sub finish { 
   my $lt = sprintf '%04d-%02d-%02d %02d:%02d:%02d' , do {my @t = @{[localtime]}[5,4,3,2,1,0] ; $t[0]+=1900 ; $t[1]++ ; @t } ; 
+  #sleep 0.5 ;
   say STDERR CYAN FAINT BOLD tv_interval( ${ dt_start } ) , " seconds spent ($0 $lt)"; 
 }
+END { finish () } 
+$SIG{INT} = sub { exit } ; # 2 #$SIG{QUIT} = sub { finish } ; # 3  Ctrl + \
+$SIG{PIPE} = sub { exit } ; # 13　# | head などで headが最初の10行で停止した時に便利
+$SIG{TERM} = sub { finish } ; # 15  (killシグナル)
 
+my @pref=qw[北海道 青森 岩手 宮城 秋田 山形 福島 茨城 栃木 群馬 埼玉 千葉 東京 神奈川 新潟 富山 石川 福井 山梨 長野 岐阜 静岡 
+愛知 三重 滋賀 京都 大阪 兵庫 奈良 和歌山 鳥取 島根 岡山 広島 山口 徳島 香川 愛媛 高知 福岡 佐賀 長崎 熊本 大分 宮崎 鹿児島 沖縄] ; 
+my %muni ; # 自治体名を格納する <-- 「伊達市 府中市」が発生するかも
+
+my $prop = $o{5} ? $o{6} ? 'age:gen' : 'age' : $o{6} ? 'gen' : 'residence' ; # 出力表示の文字列として使う。
 my %m2h ; # メッシュから人数 ;  h は HUMAN のつもり
 my %mj2h ; # メッシュと自治体から人数
-my %m2p ;  # メッシュ8桁から自治体コード5桁を参照する
+my %m2p ;  # メッシュ8桁から自治体コード(5桁or2桁)を参照する -2 で2桁
+
+& muniRead  ( \%m2p , \%muni ) if $o{r} ; 
+& file1read ( \%m2h  ) ; 
+& file2read ( \%mj2h ) ; 
+& grainOut ( \%m2h, \%mj2h , \%m2p ) , exit if $o{g} ; # -r があれば %m2pを参照
+& usualOut () , exit ; 
+
+sub usualOut {
+
+  my %m2j ; # メッシュから自治体を参照 ; -r 指定があるか否かで、中身は変わる。はず。
+  my %m2hLj ; # メッシュから、最多の人を持つ自治体の、人数を格納。Lj は "Largest by Jichitai"
+  my %j2hT ; # 自治体から人数計を参照  T はTotal
+  my %j2h ; # 自治体から、その自治体の人と思われる人の数( 合計して求める)
+
+ ## メッシュから、自治体を参照可能にする計算
+  #if ( ! $o{r} ) { 
+  if (1) {
+    for my $m ( keys %mj2h ) { 
+      my ( $jL, $hL ) = ( 0, 0 ) ; # 最大値を持つ自治体を探索 ; L は Largest ; undef のままではよくない
+      for my $j ( keys %{ $mj2h{$m} } ) { 
+          ( $jL , $hL ) = ( $j , $mj2h{$m}{$j} ) if $hL < $mj2h{$m}{$j} ;  
+      }
+      ( $m2j{$m} , $m2hLj{$m} ) = ( $jL , $hL ) ; 
+    }
+  } 
+  ## 各自治体で、人数2通りを集計
+  for my $m ( keys %m2h ){
+    next if ! exists  $m2j{ $m }  ; 
+    my $j = $o{r} ? $m2p { substr( $m, 0, 8 ) } // next : $m2j { $m } ; # my $j = $m2p { substr( $m, 0, 8 ) } // $m2j { $m } ;  
+    $j2hT { $j } += $m2h  { $m } ; 
+
+    #$j2h { $j } += $m2hLj { $m } ; # // 0 ; # <-- - "-r" 指定の時に、これで良いのか??
+    $j2h { $j } += $m2hLj { $m } if ! $o{r} ; # // 0 ; # <-- - "-r" 指定の時に、これで良いのか??
+  }
+
+  ## 出力
+  say UNDERLINE join "\t" , $prop, qw[ FILE1 FILE2 alien_ratio ] ;
+  for ( sort keys %j2hT ) { 
+    my $h  = $j2hT  {$_} ; 
+    my $h0 = $j2h {$_} ; 
+    my $val = $o{'%'} ? ($h-$h0)/$h * 100 : ($h-$h0)/$h ;
+    say join "\t" , $_ , $h , $h0 , $val ;
+  }
+}
+
+## ファイルを読み取るための関数
 
 
-MUNI_FILE_IF_R : 
-if ( $o{r} ) { 
-  my $cmd = ! $o{2} ? "gawk -F, '{print \$1,\$3}' $o{r}" : "gawk -F, '{print substr(\$1,1,2),\$3}' $o{r}" ;
+sub muniRead ( $$ ) {    # 自治体コード, 自治体名, メッシュコード8桁, 備考」
+  #my $cmd = ! $o{2} ? "gawk -F, '{print \$1,\$2,\$3}' $o{r}" : "gawk -F, '{print substr(\$1,1,2),\$2,\$3}' $o{r}" ;
+  my $cmd = "gawk -F, '{print \$1,\$2,\$3}' $o{r}" ;
   open my $FH , '-|' , $cmd ; # $/ = "\r\n" ; 
   while ( <$FH> ) { 
     chomp ; 
     next unless /^\d/ ; 
+    my @F = split / / , $_ , 3 ; #  0: 自治体コード ;  1: 自治体名 ; 2: メッシュコード
+    $_[0] -> { $F[2] } = $o{2} ? substr $F[0], 0, 2 : $F[0] ; # $o{2} ? substr $F[0], 0, 2 : $F[0] ;
+    $_[1] -> { $F[0] } = $F[1] ; # 自治体コードから自治体名を読めるようにする。(ここで5桁だった場合に。)
+  }
+  close $FH ; 
+  #say join " " , values %{$_[1]} ; exit ;
+}
+
+sub file1read ( $ ) { 
+  open my $FH , '-|' , "unzip -p $ARGV[0] | gawk -F, '{print \$3,\$7}' " or die  ; # パイプを使うことで高速化(プロセス並列化)
+  while ( <$FH> ) { 
+    next unless /^\d/ ;
+    chomp ; 
     my @F = split / / , $_ , 2 ; 
-    $m2p { $F[1] } = $F[0] ; # $o{2} ? substr $F[0], 0, 2 : $F[0] ;
+    $_[0] -> { $F[0] } = $F[1] ; # メッシュ9桁から人口を参照
   }
   close $FH ; 
 }
 
-FILE1 :
-open my $FH , '-|' , "unzip -p $ARGV[0] | gawk -F, '{print \$3,\$7}' " or die  ; # パイプを使うことで高速化(プロセス並列化)
-while ( <$FH> ) { 
-  next unless /^\d/ ;
-  chomp ; 
-  my @F = split / / , $_ , 2 ; 
-  $m2h{ $F[0] } = $F[1] ; # メッシュ9桁から人口を参照
-}
-close $FH ; 
-
-FILE2 : 
-my $prop ; # 読みとる属性 (AWKの形式で)
-$prop = $o{5} ? $o{6} ? '$5":"$6' : '$5' : $o{6} ? '$6' : '$4' ; 
-open $FH , '-|' , "unzip -p $ARGV[1] | gawk -F, '{print \$3,$prop,\$7}'" or die ; # 3:area, 4:residence, 7:population
-$prop = $o{5} ? $o{6} ? 'age:gen' : 'age' : $o{6} ? 'gen' : 'muni' ; # <-- ここに書いたのは、混乱生むかも
-while ( <$FH> ) { 
-  next unless /^\d/ ;
-  chomp ; 
-  my @F = split / / , $_ , 3 ;
-  $mj2h { $F[0] } { $F[1] } = $F[2] ; # メッシュ9桁と住民票の自治体コード(2〜5桁)から人口を参照
-}
-close $FH ;
-
-VISIT_BY_MESH :
-if ( $o{o} ) { & visit () ; exit }
-sub visit () { 
-  
-  say UNDERLINE join "\t", '¹/₂mesh', $prop, "FILE1", "FILE2" ;
-  for my $m ( keys %mj2h ) { 
-    for my $j ( keys %{ $mj2h{$m} } ) { 
-      say join "\t", $m, $j ,  (ITALIC $m2h{$m}//0) , (BOLD $mj2h{$m}{$j}) ; 
-    }
+# 
+sub file2read ( $ ) { 
+  my $pterm = $o{5} ? $o{6} ? '$5":"$6' : '$5' : $o{6} ? '$6' : '$4' ; # 読みとる属性 (AWKの形式で)
+  open my $FH , '-|' , "unzip -p $ARGV[1] | gawk -F, '{print \$3,$pterm,\$7}'" or die ; # 3:area, 4:residence, 7:population
+  while ( <$FH> ) { 
+    next unless /^\d/ ;
+    chomp ; 
+    my @F = split / / , $_ , 3 ;
+    $_[0] -> { $F[0] } { $F[1] } = $F[2] ; # メッシュ9桁と住民票の自治体コード(2〜5桁)から人口を参照
   }
+  close $FH ;
 }
 
-MESH2PREF : ## メッシュから、自治体を参照可能にする計算
-my %M2J ; # メッシュから自治体を参照
-my %m2h0 ; # メッシュから、最も自治体の人数を格納
-my %k2p ; # 自治体から人数計を参照
-my %k2p0 ; # 自治体から、その自治体の人と思われる人の数を合計
+## 結果を出力する
 
-#if ( ! $o{r} ) { 
-if ( 1 ) {
-	for my $m ( keys %mj2h ) { 
-	  my ( $tk, $tp ) = ( 0, 0 ) ; # 最大値を持つ自治体を探索		
-	  for my $k ( keys %{ $mj2h{$m} } ) { 
-	    if ( $tp < $mj2h{$m}{$k} ) { 
-	      $tp = $mj2h{$m}{$k} ; 
-	      $tk = $k ; 
-	    }
-	  }
-	  $M2J{ $m } = $tk ;
-	  $m2h0{ $m } = $tp ; 
-	}
+sub grainOut ( $$ ) { # 各メッシュごとの様子を出力 (数十万行になりうる) 
+  my ( $M2H, $MJ2H , $M2P ) = @_ ; 
+  my ( $m , $j );
+  say UNDERLINE join "\t", 'stay', $prop, "FILE1", "FILE2" ; # ¹/₂mesh
+  for $m ( sort keys %{$MJ2H} ) { 
+  	for $j ( sort keys %{ $MJ2H -> {$m } } ) { 
+  	  my $C1 = exists $o{r} ? $M2P->{ substr $m, 0, 8 } // 0  : $m ; # C1はColumn1のつもり
+  	  $C1 = $C1 > 0 ? $pref [ $C1 - 1 ] : 0 if $o{p} && $C1 =~ m/^\d{2}$/ ; # $o{r} && $o{2} && $o{p} ;
+  	  $C1 = $C1 > 0 ? $muni{$C1} // $C1 : 0 if $o{p} && $C1 =~ m/^\d{5}$/ ;
+  	  my $C2 = $j ; 
+  	  if ( ! $o{5} && ! $o{6} ) { 
+  	    $C2 = $C2 > 0 ? $pref [ $C2 - 1 ] : 0 if $o{p} && $C2 =~ m/^\d{2}$/ ; # 2文字なら都道府県コードだと見なす <-- これで大丈夫か?
+  	    $C2 = $C2 > 0 ? $muni{$C2} // $C2 : 0 if $o{p} && $C2 =~ m/^\d{5}$/ ;
+  	  }
+  	  say join "\t" , $C1 , $C2 , ( ITALIC $M2H->{$m} ) , ( BOLD $MJ2H->{$m}{$j} ) ; 
+  	}
+  }
+  #do{$m=$_;do{$j=$_;  } for keys%{$MJ2H->{$m}} } for keys%{$MJ2H} ;  
 }
-#say 5;  exit ; 
-
-## my %m2h ; # メッシュから人数 ;  h は HUMAN のつもり
-## my %mj2h ; # メッシュと自治体から人数
-## my %m2p ;  # メッシュ8桁から自治体コード5桁を参照する
-
-PREF2POPULATIONS : ## 各自治体で、人数2通りを集計
-#my %k2p ; # 自治体から人数計を参照
-#my %k2p0 ; # 自治体から、その自治体の人と思われる人の数を合計
-for my $m ( keys %m2h ){
-  next if ! exists  $M2J{ $m }  ; 
-  my $k = $m2p { substr( $m, 0, 8 ) } // $M2J { $m } ;  # <-- - ちとトリッキー ; -r なら //の左項がdefined
-  #say 5 ;
-  $k2p  { $k } += $m2h  { $m } ; 
-  $k2p0 { $k } += ($m2h0 { $m }//0) ; 
-}
-
-OUTPUT4PREFS : ## 出力
-say UNDERLINE join "\t" , $prop, qw[ FILE1 FILE2 alien_ratio ] ;
-for ( sort keys %k2p ) { 
-  my $p  = $k2p  {$_} ; 
-  my $p0 = $k2p0 {$_} ; 
-  my $val = $o{'%'} ? ($p-$p0)/$p * 100 : ($p-$p0)/$p ;
-  say join "\t" , $_ , $p , $p0 , $val ;
-}
-
-
-
-exit 0 ;
 
 
 
@@ -123,11 +142,11 @@ exit 0 ;
 =head1
 
   いろんな属性の人が、どれだけ人の集まるメッシュに行ったのかを、出力する。
-  下記でFILE2が、*00002*.zip だと各都道府県のエリア外から来た様子、*00003*.zip だと各自治体の外から来た様子が出力。
+  下記でFILE2が、*00002*.zip だと各都道府のエリア外から来た様子、*00003*.zip だと各自治体の外から来た様子が出力。
 
-  $0 [-o] FILE1 FILE2 
+  $0 [-o] [-r FILE] FILE1 FILE2 
 
-  FILE1 : 各メッシュの全人口を読む ; (必然的に)提供ファイル*0.csv.zip 
+  FILE1 : 各メッシュの全人口を読む ; (必然的に)提供ファイル*0.csv.zip ; どれだけ混雑した所に出掛けたか知るため
   FILE2 ; 住居情報付きの情報を読む ; 提供ファイル*00000[23].csv.zip ; 
   1番目のファイルでまず各メッシュの人口を記録
   2番目のファイルで、何かする。
@@ -135,14 +154,16 @@ exit 0 ;
   メッシュコードから、制定された自治体コードを見るようなことは、していない。
 
  オプション : 
-    -o : ある自治体に住む何人が、どれだけ人が集まったメッシュに出掛けたのか、各メッシュごとに細かく見る。
+    -g : ある自治体に住む何人が、どれだけ人が集まったメッシュに出掛けたのか、各メッシュごとに細かく見る。
+    -p : (可能なら)県名で出す
+    -r FILE : メッシュコードから自治体コートを参照するデータファイルで「自治体コード, 自治体名, メッシュコード8桁, 備考」の計3列または4列 (five4eight.csv)
     -% ; 割合を百分率で表示
-    -2 : 
+    -2 : メッシュコードから参照する自治体コードを (5桁では無くて)、先頭の自治体コード2桁のみにして、都道府のみを参照する。
     -5 ; 年齢帯を読み取る
     -6 ; 性別を読み取る (-5と併用できる)
 
  開発上のメモ: 
-   * split関数による方法よりも高速化するために、固定長にしたらどうだろうか?	
+   * split関数による方法よりも高速化するために、固定長にしたらどうだろうか?  
 
 =cut 
 
